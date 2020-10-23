@@ -1,0 +1,127 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float maskLeft;
+uniform float maskRight;
+uniform float maskTop;
+uniform float maskBottom;
+uniform float feathering;
+uniform float opacity;
+
+
+sampler_state def_sampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertInOut {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+	VertInOut vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = vert_in.uv;
+	return vert_out;
+}
+
+float4 PSDrawPart(VertInOut vert_in) : TARGET
+{
+	float featheringHorizontal = 0.0;
+	if(maskLeft + maskRight > 1.0){
+		if(vert_in.uv.x > maskLeft + feathering || 1.0 - vert_in.uv.x > maskRight + feathering){
+			featheringHorizontal = 0.0;
+		}else{
+			float featheringLeft = 1.0;
+			if(maskLeft < 1.0 && vert_in.uv.x > maskLeft - feathering)
+				featheringLeft = (((maskLeft + feathering) - vert_in.uv.x)/(feathering*2.0));
+			float featheringRight = 1.0;
+			if(maskRight < 1.0 && 1.0-vert_in.uv.x > maskRight - feathering)
+				featheringRight = (((maskRight + feathering) - (1.0-vert_in.uv.x))/(feathering*2.0));
+			if(featheringRight < featheringLeft)
+				featheringHorizontal = featheringRight;
+			else
+				featheringHorizontal = featheringLeft;
+		}
+	}else if(maskLeft > 0.0 || maskRight > 0.0){
+		if((maskLeft <= 0.0 || vert_in.uv.x > maskLeft + feathering) && (maskRight <= 0.0 || 1.0-vert_in.uv.x > maskRight + feathering)){
+			featheringHorizontal = 0.0;
+		}else{
+			float featheringLeft = 0.0;
+			if(maskLeft > 0.0 && maskLeft < 1.0 && vert_in.uv.x > maskLeft - feathering && vert_in.uv.x < maskLeft + feathering)
+				featheringLeft = (((maskLeft + feathering) - vert_in.uv.x)/(feathering*2.0));
+			float featheringRight = 0.0;	
+			if(maskRight > 0.0 && maskRight < 1.0 && 1.0-vert_in.uv.x > maskRight - feathering && 1.0-vert_in.uv.x < maskRight + feathering)
+				featheringRight = (((maskRight + feathering) - (1.0-vert_in.uv.x))/(feathering*2.0));
+			if(featheringRight > featheringLeft)
+				featheringHorizontal = featheringRight;
+			else if(featheringLeft > featheringRight || featheringLeft > 0.0)
+				featheringHorizontal = featheringLeft;
+			else
+				featheringHorizontal = 1.0;
+		}
+	}
+
+	float featheringVertical = 0.0;
+	if(maskTop + maskBottom > 1.0){
+		if(vert_in.uv.y > maskTop + feathering || 1.0 - vert_in.uv.y > maskBottom + feathering){
+			featheringVertical = 0.0;
+		}else{
+			float featheringTop = 1.0;
+			if(maskTop < 1.0 && vert_in.uv.y > maskTop - feathering)
+				featheringTop = (((maskTop + feathering) - vert_in.uv.y)/(feathering*2.0));
+			float featheringBottom = 1.0;
+			if(maskBottom < 1.0 && 1.0-vert_in.uv.y > maskBottom - feathering)
+				featheringBottom = (((maskBottom + feathering) - (1.0-vert_in.uv.y))/(feathering*2.0));
+			if(featheringBottom < featheringTop)
+				featheringVertical = featheringBottom;
+			else 
+				featheringVertical = featheringTop;
+		}
+	}else if(maskTop > 0.0 || maskBottom > 0.0){
+		if((maskTop <= 0.0 || vert_in.uv.y > maskTop + feathering) && (maskBottom <= 0.0 || 1.0-vert_in.uv.y > maskBottom + feathering)){
+			featheringVertical = 0.0;
+		}else{
+			float featheringTop = 0.0;
+			if(maskTop > 0.0 && maskTop < 1.0 && vert_in.uv.y > maskTop - feathering && vert_in.uv.y < maskTop + feathering)
+				featheringTop = (((maskTop + feathering) - vert_in.uv.y)/(feathering*2.0));
+			float featheringBottom = 0.0;	
+			if(maskBottom > 0.0 && maskBottom < 1.0 && 1.0-vert_in.uv.y > maskBottom - feathering && 1.0-vert_in.uv.y < maskBottom + feathering)
+				featheringBottom = (((maskBottom + feathering) - (1.0-vert_in.uv.y))/(feathering*2.0));
+			if(featheringBottom > featheringTop)
+				featheringVertical = featheringBottom;
+			else if(featheringTop > featheringBottom || featheringTop > 0.0)
+				featheringVertical = featheringTop;
+			else
+				featheringVertical = 1.0;
+		}
+	}
+	float feathering = 0.0;
+	if(maskTop + maskBottom > 1.0 && maskLeft + maskRight > 1.0){
+		if(featheringVertical < featheringHorizontal)
+			feathering = featheringVertical;
+		else
+			feathering = featheringHorizontal;
+	}else{
+		if(featheringVertical > featheringHorizontal)
+			feathering = featheringVertical;
+		else if(featheringHorizontal > featheringVertical || featheringHorizontal > 0.0)
+			feathering = featheringHorizontal;
+	}
+	if(feathering <= 0.0)
+		return float4(0.0,0.0,0.0,0.0);
+	float4 rgba = image.Sample(def_sampler, vert_in.uv);
+	rgba.a = rgba.a * feathering * opacity;
+	return rgba;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader  = PSDrawPart(vert_in);
+	}
+}
