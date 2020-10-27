@@ -128,9 +128,6 @@ static void freeze_destroy(void *data)
 
 static void draw_frame(struct freeze_info *f)
 {
-	gs_blend_state_push();
-	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-	
 	gs_effect_t *effect = f->mask ? f->effect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
 	if (f->mask)
 		obs_source_skip_video_filter(f->source);
@@ -157,11 +154,15 @@ static void draw_frame(struct freeze_info *f)
 			gs_effect_set_float(p, f->feathering);
 			p = gs_effect_get_param_by_name(effect, "opacity");
 			gs_effect_set_float(p, 1.0f);
+			gs_blend_state_push();
+			gs_blend_function(GS_BLEND_SRCALPHA,
+					  GS_BLEND_INVSRCALPHA);
 		}
 		while (gs_effect_loop(effect, "Draw"))
 			gs_draw_sprite(tex, 0, f->cx, f->cy);
+		if (f->mask && f->effect)
+			gs_blend_state_pop();
 	}
-	gs_blend_state_pop();
 }
 
 static void freeze_video_render(void *data, gs_effect_t *effect)
