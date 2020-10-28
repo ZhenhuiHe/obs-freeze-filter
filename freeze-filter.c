@@ -30,6 +30,9 @@ struct freeze_info {
 	float mask_top;
 	float mask_bottom;
 	float feathering;
+
+	uint32_t fade_duration;
+	float fading;
 };
 
 static const char *freeze_get_name(void *type_data)
@@ -82,6 +85,7 @@ static void freeze_update(void *data, obs_data_t *settings)
 	freeze->duration_max = obs_data_get_int(settings, "duration");
 	freeze->refresh_interval =
 		obs_data_get_int(settings, "refresh_interval");
+	freeze->fade_duration = obs_data_get_int(settings, "fade_duration");
 	freeze->activate_action = obs_data_get_int(settings, "activate_action");
 	freeze->deactivate_action =
 		obs_data_get_int(settings, "deactivate_action");
@@ -106,6 +110,7 @@ static void *freeze_create(obs_data_t *settings, obs_source_t *source)
 	struct freeze_info *freeze = bzalloc(sizeof(struct freeze_info));
 	freeze->source = source;
 	freeze->hotkey = OBS_INVALID_HOTKEY_PAIR_ID;
+	freeze->fading = -1.0f;
 	obs_enter_graphics();
 	char *effect_path = obs_module_file("freeze_part.effect");
 	freeze->effect = gs_effect_create_from_file(effect_path, NULL);
@@ -128,39 +133,49 @@ static void freeze_destroy(void *data)
 
 static void draw_frame(struct freeze_info *f)
 {
-	gs_effect_t *effect = f->mask ? f->effect : obs_get_base_effect(OBS_EFFECT_DEFAULT);
-	if (f->mask)
-		obs_source_skip_video_filter(f->source);
 
-	if (!effect)
-		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	if (f->mask ||
+	    (f->fading >= 0.0f && f->fading * 1000.0 < f->fade_duration))
+		obs_source_skip_video_filter(f->source);
 
 	gs_texture_t *tex = gs_texrender_get_texture(f->render);
 	if (tex) {
+		gs_effect_t *effect = f->effect;
+		if (!effect)
+			effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
 		gs_eparam_t *image =
 			gs_effect_get_param_by_name(effect, "image");
 		gs_effect_set_texture(image, tex);
-		if (f->mask && f->effect) {
+		if (f->effect) {
 			gs_eparam_t *p =
-				gs_effect_get_param_by_name(effect, "maskLeft");
-			gs_effect_set_float(p, f->mask_left);
+				gs_effect_get_param_by_name(effect, "opacity");
+			if (f->fading >= 0.0f &&
+			    f->fading * 1000.0 < f->fade_duration) {
+				gs_effect_set_float(
+					p, ((float)f->fade_duration -
+					    (f->fading * 1000.0f)) /
+						   (float)f->fade_duration);
+			} else {
+				gs_effect_set_float(p, 1.0f);
+			}
+			p = gs_effect_get_param_by_name(effect, "maskLeft");
+			gs_effect_set_float(p, f->mask ? f->mask_left : 1.0f);
 			p = gs_effect_get_param_by_name(effect, "maskRight");
-			gs_effect_set_float(p, f->mask_right);
+			gs_effect_set_float(p, f->mask ? f->mask_right : 1.0f);
 			p = gs_effect_get_param_by_name(effect, "maskTop");
-			gs_effect_set_float(p, f->mask_top);
+			gs_effect_set_float(p, f->mask ? f->mask_top : 1.0f);
 			p = gs_effect_get_param_by_name(effect, "maskBottom");
-			gs_effect_set_float(p, f->mask_bottom);
+			gs_effect_set_float(p, f->mask ? f->mask_bottom : 1.0f);
 			p = gs_effect_get_param_by_name(effect, "feathering");
 			gs_effect_set_float(p, f->feathering);
-			p = gs_effect_get_param_by_name(effect, "opacity");
-			gs_effect_set_float(p, 1.0f);
+
 			gs_blend_state_push();
 			gs_blend_function(GS_BLEND_SRCALPHA,
 					  GS_BLEND_INVSRCALPHA);
 		}
 		while (gs_effect_loop(effect, "Draw"))
 			gs_draw_sprite(tex, 0, f->cx, f->cy);
-		if (f->mask && f->effect)
+		if (f->effect)
 			gs_blend_state_pop();
 	}
 }
@@ -233,6 +248,11 @@ static obs_properties_t *freeze_properties(void *data)
 				   100000, 1000);
 	obs_property_int_set_suffix(p, "ms");
 
+	p = obs_properties_add_int(ppts, "fade_duration",
+				   obs_module_text("FadeDuration"), 0, 10000,
+				   1000);
+	obs_property_int_set_suffix(p, "ms");
+
 	obs_properties_t *group = obs_properties_create();
 
 	p = obs_properties_add_float_slider(group, "mask_left",
@@ -298,11 +318,14 @@ bool freeze_enable_hotkey(void *data, obs_hotkey_pair_id id,
 	struct freeze_info *freeze = data;
 	if (!pressed)
 		return false;
-
-	if (obs_source_enabled(freeze->source))
+	if (obs_source_enabled(freeze->source) && freeze->fading < 0.0f)
 		return false;
 
-	obs_source_set_enabled(freeze->source, true);
+	if (freeze->fading >= 0.0f)
+		freeze->fading = -1.0f;
+	
+	if (!obs_source_enabled(freeze->source))
+		obs_source_set_enabled(freeze->source, true);
 
 	return true;
 }
@@ -313,10 +336,13 @@ bool freeze_disable_hotkey(void *data, obs_hotkey_pair_id id,
 	struct freeze_info *freeze = data;
 	if (!pressed)
 		return false;
-	if (!obs_source_enabled(freeze->source))
+	if (!obs_source_enabled(freeze->source) || freeze->fading >= 0.0f)
 		return false;
-
-	obs_source_set_enabled(freeze->source, false);
+	if (freeze->fade_duration) {
+		freeze->fading = 0.0f;
+	} else {
+		obs_source_set_enabled(freeze->source, false);
+	}
 	return true;
 }
 
@@ -327,13 +353,16 @@ void freeze_do_action(struct freeze_info *freeze, uint32_t action)
 		obs_source_set_enabled(freeze->source, true);
 	} else if (action == FREEZE_ACTION_DISABLE &&
 		   obs_source_enabled(freeze->source)) {
-		obs_source_set_enabled(freeze->source, false);
+		if (freeze->fade_duration) {
+			freeze->fading = 0.0f;
+		} else {
+			obs_source_set_enabled(freeze->source, false);
+		}
 	}
 }
 
 static void freeze_tick(void *data, float t)
 {
-
 	struct freeze_info *f = data;
 
 	if (f->delayed_action != FREEZE_ACTION_NONE) {
@@ -344,10 +373,23 @@ static void freeze_tick(void *data, float t)
 		}
 	}
 
+	if (f->fading >= 0.0f) {
+		f->fading += t;
+		if (f->fading * 1000.0 >= f->fade_duration) {
+			f->fading = -1.0f;
+			obs_source_set_enabled(f->source, false);
+		}
+	}
+
 	if (obs_source_enabled(f->source)) {
 		f->duration += t;
 		if (f->duration_max && f->duration * 1000.0 > f->duration_max) {
-			obs_source_set_enabled(f->source, false);
+			if (f->fade_duration) {
+				if (f->fading < 0.0f)
+					f->fading = 0.0f;
+			} else {
+				obs_source_set_enabled(f->source, false);
+			}
 		} else if (f->refresh_interval &&
 			   f->duration > f->last_refresh &&
 			   (f->duration - f->last_refresh) * 1000.0 >=
@@ -372,7 +414,7 @@ static void freeze_tick(void *data, float t)
 				f);
 		}
 	}
-	if(check_size(f))
+	if (check_size(f))
 		f->processed_frame = false;
 }
 
