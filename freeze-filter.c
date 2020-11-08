@@ -1,13 +1,18 @@
 #include <obs-module.h>
 #include "freeze-filter.h"
 
+#include <util/circlebuf.h>
+
 struct freeze_info {
 	obs_source_t *source;
-	gs_texrender_t *render;
+
+	struct circlebuf renders;
+	long long max_renders;
 	uint32_t cx;
 	uint32_t cy;
 	bool target_valid;
 	bool processed_frame;
+	size_t frames_loaded;
 	obs_hotkey_pair_id hotkey;
 	float duration;
 	uint32_t duration_max;
@@ -43,15 +48,19 @@ static const char *freeze_get_name(void *type_data)
 
 static void free_textures(struct freeze_info *f, bool destroy_effect)
 {
-	if (!f->render)
+	if (!f->renders.size && !destroy_effect)
 		return;
 	obs_enter_graphics();
+	while (f->renders.size) {
+		gs_texrender_t *render;
+		circlebuf_pop_front(&f->renders, &render,
+				    sizeof(gs_texrender_t *));
+		gs_texrender_destroy(render);
+	}
 	if (destroy_effect) {
 		gs_effect_destroy(f->effect);
 		f->effect = NULL;
 	}
-	gs_texrender_destroy(f->render);
-	f->render = NULL;
 	obs_leave_graphics();
 }
 
@@ -82,6 +91,9 @@ static inline bool check_size(struct freeze_info *f)
 static void freeze_update(void *data, obs_data_t *settings)
 {
 	struct freeze_info *freeze = data;
+	freeze->max_renders = obs_data_get_int(settings, "frames");
+	if (freeze->max_renders <= 0)
+		freeze->max_renders = 1;
 	freeze->duration_max = obs_data_get_int(settings, "duration");
 	freeze->refresh_interval =
 		obs_data_get_int(settings, "refresh_interval");
@@ -135,10 +147,28 @@ static void draw_frame(struct freeze_info *f)
 {
 
 	if (f->mask ||
-	    (f->fading >= 0.0f && f->fading * 1000.0 < f->fade_duration))
+	    (f->fading >= 0.0f && f->fading * 1000.0 < f->fade_duration) || !f->renders.size)
 		obs_source_skip_video_filter(f->source);
 
-	gs_texture_t *tex = gs_texrender_get_texture(f->render);
+	if (!f->renders.size || f->frames_loaded < f->max_renders)
+		return;
+
+	while (f->renders.size >
+	       f->max_renders * sizeof(gs_texrender_t *)) {
+		gs_texrender_t *render;
+		circlebuf_pop_front(&f->renders, &render,
+				    sizeof(gs_texrender_t *));
+		gs_texrender_destroy(render);
+	}
+
+	const size_t count = f->renders.size / sizeof(gs_texrender_t *);
+	const size_t r = (size_t)rand();
+	const size_t frame = r % count;
+	gs_texrender_t *render = *(gs_texrender_t **)circlebuf_data(
+		&f->renders,
+		       frame * sizeof(gs_texrender_t *));
+	
+	gs_texture_t *tex = gs_texrender_get_texture(render);
 	if (tex) {
 		gs_effect_t *effect = f->effect;
 		if (!effect)
@@ -190,20 +220,27 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 		obs_source_skip_video_filter(freeze->source);
 		return;
 	}
-	if (freeze->processed_frame) {
+	if (freeze->processed_frame || freeze->frames_loaded >= freeze->max_renders) {
 		draw_frame(freeze);
 		return;
 	}
-	if (!freeze->render) {
-		freeze->render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+	gs_texrender_t *render = NULL;
+	if (freeze->renders.size &&
+	    freeze->renders.size >=
+		    freeze->max_renders * sizeof(gs_texrender_t *))
+		circlebuf_pop_front(&freeze->renders, &render,	    sizeof(gs_texrender_t *));		
+	
+
+	if (!render) {
+		render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	} else {
-		gs_texrender_reset(freeze->render);
+		gs_texrender_reset(render);
 	}
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
 
-	if (gs_texrender_begin(freeze->render, freeze->cx, freeze->cy)) {
+	if (gs_texrender_begin(render, freeze->cx, freeze->cy)) {
 		uint32_t parent_flags = obs_source_get_output_flags(target);
 		bool custom_draw = (parent_flags & OBS_SOURCE_CUSTOM_DRAW) != 0;
 		bool async = (parent_flags & OBS_SOURCE_ASYNC) != 0;
@@ -219,12 +256,15 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 		else
 			obs_source_video_render(target);
 
-		gs_texrender_end(freeze->render);
+		gs_texrender_end(render);
 	}
 
 	gs_blend_state_pop();
+	circlebuf_push_back(&freeze->renders, &render,
+			    sizeof(gs_texrender_t *));
 	draw_frame(freeze);
 	freeze->processed_frame = true;
+	freeze->frames_loaded++;
 }
 
 static void prop_list_add_actions(obs_property_t *p)
@@ -252,6 +292,9 @@ static obs_properties_t *freeze_properties(void *data)
 				   obs_module_text("FadeDuration"), 0, 10000,
 				   1000);
 	obs_property_int_set_suffix(p, "ms");
+
+		p = obs_properties_add_int(ppts, "frames", obs_module_text("Frames"), 1,
+				   100, 1);
 
 	obs_properties_t *group = obs_properties_create();
 
@@ -309,6 +352,7 @@ static obs_properties_t *freeze_properties(void *data)
 
 void freeze_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_int(settings, "frames", 1);
 	obs_data_set_default_double(settings, "feathering", 2.0);
 }
 
@@ -394,11 +438,11 @@ static void freeze_tick(void *data, float t)
 			   f->duration > f->last_refresh &&
 			   (f->duration - f->last_refresh) * 1000.0 >=
 				   f->refresh_interval) {
-			f->processed_frame = false;
+			f->frames_loaded = 0;
 			f->last_refresh = f->duration;
 		}
 	} else {
-		f->processed_frame = false;
+		f->frames_loaded = 0;
 		f->duration = 0.0f;
 		f->last_refresh = 0.0f;
 	}
@@ -415,7 +459,8 @@ static void freeze_tick(void *data, float t)
 		}
 	}
 	if (check_size(f))
-		f->processed_frame = false;
+		f->frames_loaded = 0;
+	f->processed_frame = false;
 }
 
 void freeze_activate(void *data)
