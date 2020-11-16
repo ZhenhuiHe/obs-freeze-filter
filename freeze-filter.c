@@ -13,6 +13,9 @@ struct freeze_info {
 	bool target_valid;
 	bool processed_frame;
 	size_t frames_loaded;
+	size_t current_frame;
+	long long freeze_mode;
+	bool backward;
 	obs_hotkey_pair_id hotkey;
 	float duration;
 	uint32_t duration_max;
@@ -94,6 +97,7 @@ static void freeze_update(void *data, obs_data_t *settings)
 	freeze->max_renders = obs_data_get_int(settings, "frames");
 	if (freeze->max_renders <= 0)
 		freeze->max_renders = 1;
+	freeze->freeze_mode = obs_data_get_int(settings, "freeze_mode");
 	freeze->duration_max = obs_data_get_int(settings, "duration");
 	freeze->refresh_interval =
 		obs_data_get_int(settings, "refresh_interval");
@@ -147,14 +151,14 @@ static void draw_frame(struct freeze_info *f)
 {
 
 	if (f->mask ||
-	    (f->fading >= 0.0f && f->fading * 1000.0 < f->fade_duration) || !f->renders.size)
+	    (f->fading >= 0.0f && f->fading * 1000.0 < f->fade_duration) ||
+	    !f->renders.size)
 		obs_source_skip_video_filter(f->source);
 
 	if (!f->renders.size || f->frames_loaded < f->max_renders)
 		return;
 
-	while (f->renders.size >
-	       f->max_renders * sizeof(gs_texrender_t *)) {
+	while (f->renders.size > f->max_renders * sizeof(gs_texrender_t *)) {
 		gs_texrender_t *render;
 		circlebuf_pop_front(&f->renders, &render,
 				    sizeof(gs_texrender_t *));
@@ -162,12 +166,13 @@ static void draw_frame(struct freeze_info *f)
 	}
 
 	const size_t count = f->renders.size / sizeof(gs_texrender_t *);
-	const size_t r = (size_t)rand();
-	const size_t frame = r % count;
+	size_t frame = f->current_frame;
+	if (frame >= count) {
+		frame = count - 1;
+	}
 	gs_texrender_t *render = *(gs_texrender_t **)circlebuf_data(
-		&f->renders,
-		       frame * sizeof(gs_texrender_t *));
-	
+		&f->renders, frame * sizeof(gs_texrender_t *));
+
 	gs_texture_t *tex = gs_texrender_get_texture(render);
 	if (tex) {
 		gs_effect_t *effect = f->effect;
@@ -220,7 +225,8 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 		obs_source_skip_video_filter(freeze->source);
 		return;
 	}
-	if (freeze->processed_frame || freeze->frames_loaded >= freeze->max_renders) {
+	if (freeze->processed_frame ||
+	    freeze->frames_loaded >= freeze->max_renders) {
 		draw_frame(freeze);
 		return;
 	}
@@ -228,8 +234,8 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 	if (freeze->renders.size &&
 	    freeze->renders.size >=
 		    freeze->max_renders * sizeof(gs_texrender_t *))
-		circlebuf_pop_front(&freeze->renders, &render,	    sizeof(gs_texrender_t *));		
-	
+		circlebuf_pop_front(&freeze->renders, &render,
+				    sizeof(gs_texrender_t *));
 
 	if (!render) {
 		render = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
@@ -265,6 +271,10 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 	draw_frame(freeze);
 	freeze->processed_frame = true;
 	freeze->frames_loaded++;
+	if (freeze->freeze_mode == FREEZE_MODE_BACK_FORTH) {
+		freeze->current_frame = freeze->frames_loaded;
+		freeze->backward = true;
+	}
 }
 
 static void prop_list_add_actions(obs_property_t *p)
@@ -293,8 +303,17 @@ static obs_properties_t *freeze_properties(void *data)
 				   1000);
 	obs_property_int_set_suffix(p, "ms");
 
-		p = obs_properties_add_int(ppts, "frames", obs_module_text("Frames"), 1,
+	p = obs_properties_add_int(ppts, "frames", obs_module_text("Frames"), 1,
 				   100, 1);
+
+	p = obs_properties_add_list(ppts, "freeze_mode",
+				    obs_module_text("FreezeMode"),
+				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(p, obs_module_text("Random"),
+				  FREEZE_MODE_RANDOM);
+	obs_property_list_add_int(p, obs_module_text("Loop"), FREEZE_MODE_LOOP);
+	obs_property_list_add_int(p, obs_module_text("BackForth"),
+				  FREEZE_MODE_BACK_FORTH);
 
 	obs_properties_t *group = obs_properties_create();
 
@@ -367,7 +386,7 @@ bool freeze_enable_hotkey(void *data, obs_hotkey_pair_id id,
 
 	if (freeze->fading >= 0.0f)
 		freeze->fading = -1.0f;
-	
+
 	if (!obs_source_enabled(freeze->source))
 		obs_source_set_enabled(freeze->source, true);
 
@@ -461,6 +480,38 @@ static void freeze_tick(void *data, float t)
 	if (check_size(f))
 		f->frames_loaded = 0;
 	f->processed_frame = false;
+
+	const size_t count = f->frames_loaded;
+	if (count <= 1) {
+		f->current_frame = 0;
+	} else if (f->freeze_mode == FREEZE_MODE_RANDOM) {
+		const size_t r = (size_t)rand();
+		f->current_frame = r % count;
+	} else if (f->freeze_mode == FREEZE_MODE_LOOP) {
+		if (f->current_frame < count - 1) {
+			f->current_frame++;
+		} else {
+			f->current_frame = 0;
+		}
+	} else if (f->freeze_mode == FREEZE_MODE_BACK_FORTH) {
+		if (f->backward) {
+			if (f->current_frame > 0) {
+				f->current_frame--;
+			} else {
+				f->backward = false;
+				if (f->current_frame < count - 1)
+					f->current_frame++;
+			}
+		} else {
+			if (f->current_frame < count - 1) {
+				f->current_frame++;
+			} else {
+				f->backward = true;
+				if (f->current_frame > 0)
+					f->current_frame--;
+			}
+		}
+	}
 }
 
 void freeze_activate(void *data)
