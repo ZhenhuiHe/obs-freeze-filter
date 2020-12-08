@@ -158,7 +158,7 @@ static void draw_frame(struct freeze_info *f)
 	    !f->renders.size)
 		obs_source_skip_video_filter(f->source);
 
-	if (!f->renders.size || f->frames_loaded < f->max_renders)
+	if (!f->renders.size)
 		return;
 
 	while (f->renders.size > f->max_renders * sizeof(gs_texrender_t *)) {
@@ -271,13 +271,14 @@ static void freeze_video_render(void *data, gs_effect_t *effect)
 	gs_blend_state_pop();
 	circlebuf_push_back(&freeze->renders, &render,
 			    sizeof(gs_texrender_t *));
-	draw_frame(freeze);
 	freeze->processed_frame = true;
+	freeze->current_frame =
+		(freeze->renders.size / sizeof(gs_texrender_t *)) - 1;
 	freeze->frames_loaded++;
 	if (freeze->freeze_mode == FREEZE_MODE_BACK_FORTH) {
-		freeze->current_frame = freeze->frames_loaded;
 		freeze->backward = true;
 	}
+	draw_frame(freeze);
 }
 
 static void prop_list_add_actions(obs_property_t *p)
@@ -506,7 +507,9 @@ static void freeze_tick(void *data, float t)
 	f->processed_frame = false;
 
 	const size_t count = f->frames_loaded;
-	if (count <= 1) {
+	if (f->max_renders && count < f->max_renders) {
+		
+	}else if (count <= 1) {
 		f->current_frame = 0;
 	} else if (f->freeze_mode == FREEZE_MODE_RANDOM) {
 		const size_t r = (size_t)rand();
